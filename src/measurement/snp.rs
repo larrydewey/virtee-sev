@@ -57,7 +57,7 @@ impl SnpLaunchDigest {
 
     /// Get the launch digest as a hex string
     pub fn get_hex_ld(self) -> String {
-        hex::encode::<&[u8]>(self.0.as_slice())
+        hex::encode::<&[u8]>(&self.0)
     }
 }
 

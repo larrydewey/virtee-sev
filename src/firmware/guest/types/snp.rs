@@ -1,21 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::error::AttestationReportError;
-use crate::{certs::snp::ecdsa::Signature, firmware::host::TcbVersion, util::hexdump};
-
 #[cfg(any(feature = "openssl", feature = "crypto_nossl"))]
 use crate::certs::snp::{Certificate, Chain, Verifiable};
 
-use crate::util::sealed;
-use bitfield::bitfield;
+use crate::{
+    certs::snp::ecdsa::Signature,
+    error::AttestationReportError,
+    firmware::host::TcbVersion,
+    firmware::parser::{ByteParser, ReadExt, WriteExt},
+    util::hexdump,
+};
+
 use serde::{Deserialize, Serialize, Serializer};
-use serde_big_array::BigArray;
-use std::convert::{TryFrom, TryInto};
 
-use std::fmt::Display;
+use std::{fmt::Display, io::Write};
 
-// #[cfg(any(feature = "openssl", feature = "crypto_nossl"))]
-use std::io::{self, Error, ErrorKind};
+#[cfg(any(feature = "openssl", feature = "crypto_nossl"))]
+use std::{
+    convert::TryFrom,
+    io::{self, ErrorKind},
+};
+
+#[cfg(feature = "openssl")]
+use std::io::Error;
+
+use bitfield::bitfield;
 
 #[cfg(feature = "openssl")]
 use openssl::{ecdsa::EcdsaSig, sha::Sha384};
@@ -102,20 +111,66 @@ bitfield! {
     pub get_tcb_version, set_tcb_version: 5, 5;
 }
 
-/// Trait shared between attestation reports to be able to verify them against the VEK.
-pub trait Attestable: Serialize + sealed::Sealed {
-    /// Serialize the provided Attestation Report and get the measurable bytes from it
-    fn measurable_bytes(&self) -> io::Result<Vec<u8>> {
-        let measurable_bytes: &[u8] = &bincode::serialize(self).map_err(|e| {
-            Error::new(
-                ErrorKind::Other,
-                format!("Unable to serialize bytes: {}", e),
-            )
-        })?;
-        Ok(measurable_bytes[..0x2a0].to_vec())
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+/// A semver formatted version.
+pub struct Version {
+    /// Major Version
+    pub major: u8,
+    /// Minor Version
+    pub minor: u8,
+    /// Build Version
+    pub build: u8,
+}
+
+impl Version {
+    /// Create a new version.
+    pub fn new(major: u8, minor: u8, build: u8) -> Self {
+        Self {
+            major,
+            minor,
+            build,
+        }
     }
-    /// Get the attestation report signature
-    fn signature(&self) -> &Signature;
+}
+
+impl Default for Version {
+    fn default() -> Self {
+        ByteParser::default()
+    }
+}
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.build)
+    }
+}
+
+impl ByteParser for Version {
+    type Bytes = [u8; 3];
+
+    #[inline(always)]
+    fn from_bytes(bytes: Self::Bytes) -> Self {
+        let [build, minor, major] = bytes;
+        Self {
+            major,
+            minor,
+            build,
+        }
+    }
+
+    #[inline(always)]
+    fn to_bytes(&self) -> Self::Bytes {
+        [self.build, self.minor, self.major]
+    }
+
+    #[inline(always)]
+    fn default() -> Self {
+        Self {
+            major: 0,
+            minor: 0,
+            build: 0,
+        }
+    }
 }
 
 /// The guest can request that the firmware construct an attestation report. External entities can use an
@@ -141,33 +196,12 @@ pub trait Attestable: Serialize + sealed::Sealed {
 ///
 /// Since the release of the 1.56 ABI, the Attestation Report was bumped from version 2 to 3.
 /// Due to content differences, both versions are kept separately in order to provide backwards compatibility and most reliable security.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttestationReport {
     /// Version 2 of the Attestation Report
     V2(AttestationReportV2),
     /// Version 3 of the Attestation Report
     V3(AttestationReportV3),
-}
-
-impl TryFrom<&[u8]> for AttestationReport {
-    type Error = AttestationReportError;
-
-    fn try_from(raw_report: &[u8]) -> Result<Self, Self::Error> {
-        let version =
-            u32::from_le_bytes([raw_report[0], raw_report[1], raw_report[2], raw_report[3]]);
-        // Return the appropriate report version
-        match version {
-            2 => {
-                let report_v2: AttestationReportV2 = raw_report.try_into()?;
-                Ok(AttestationReport::V2(report_v2))
-            }
-            3 => {
-                let report_v3: AttestationReportV3 = raw_report.try_into()?;
-                Ok(AttestationReport::V3(report_v3))
-            }
-            _ => Err(AttestationReportError::UnsupportedReportVersion(version))?,
-        }
-    }
 }
 
 /// Implement custom serialization for AttestationReport
@@ -185,35 +219,19 @@ impl Serialize for AttestationReport {
     }
 }
 
-impl sealed::Sealed for AttestationReport {}
-
-impl Attestable for AttestationReport {
-    fn measurable_bytes(&self) -> io::Result<Vec<u8>> {
-        //Return measurable bytes for the report
-        match self {
-            Self::V2(v2) => Ok(v2.measurable_bytes()?),
-
-            Self::V3(v3) => Ok(v3.measurable_bytes()?),
-        }
+impl From<&AttestationReportV2> for AttestationReport {
+    fn from(value: &AttestationReportV2) -> Self {
+        AttestationReport::V2(*value)
     }
-    fn signature(&self) -> &Signature {
-        match self {
-            Self::V2(v2) => v2.signature(),
-            Self::V3(v3) => v3.signature(),
-        }
+}
+
+impl From<&AttestationReportV3> for AttestationReport {
+    fn from(value: &AttestationReportV3) -> Self {
+        AttestationReport::V3(*value)
     }
 }
 
 impl AttestationReport {
-    /// Convert bytes to an Attestation Report Enum
-    pub fn from_bytes(bytes: &[u8]) -> Result<AttestationReport, AttestationReportError> {
-        AttestationReport::try_from(bytes)
-    }
-
-    /// Serialize the Attestation Report enum to raw bytes
-    pub fn to_bytes(&self) -> Result<Vec<u8>, AttestationReportError> {
-        bincode::serialize(self).map_err(|e| AttestationReportError::BincodeError(*e))
-    }
     /// Get Attestation Report Version
     pub fn version(&self) -> u32 {
         match self {
@@ -356,12 +374,10 @@ impl AttestationReport {
     }
 
     /// Get the CPUID info from the report (V3 only)
-    pub fn cpuid(&self) -> Result<(u8, u8, u8), AttestationReportError> {
+    pub fn cpuid(&self) -> Option<(u8, u8, u8)> {
         match self {
-            Self::V2(_) => Err(AttestationReportError::UnsupportedField(
-                "cpuid information".to_string(),
-            )),
-            Self::V3(report) => Ok((report.cpuid_fam_id, report.cpuid_mod_id, report.cpuid_step)),
+            Self::V2(_) => None,
+            Self::V3(report) => Some((report.cpuid_fam_id, report.cpuid_mod_id, report.cpuid_step)),
         }
     }
 
@@ -374,7 +390,7 @@ impl AttestationReport {
     }
 
     /// Get commited TCB
-    pub fn commited_tcb(&self) -> TcbVersion {
+    pub fn committed_tcb(&self) -> TcbVersion {
         match self {
             Self::V2(report) => report.committed_tcb,
             Self::V3(report) => report.committed_tcb,
@@ -382,34 +398,18 @@ impl AttestationReport {
     }
 
     /// Get the current version in the report (major,minor,build)
-    pub fn current_version(&self) -> (u8, u8, u8) {
+    pub fn current(&self) -> Version {
         match self {
-            Self::V2(report) => (
-                report.current_major,
-                report.current_minor,
-                report.current_build,
-            ),
-            Self::V3(report) => (
-                report.current_major,
-                report.current_minor,
-                report.current_build,
-            ),
+            Self::V2(report) => report.current,
+            Self::V3(report) => report.current,
         }
     }
 
     /// Get the committed version in the report (major,minor,build)
-    pub fn commited_version(&self) -> (u8, u8, u8) {
+    pub fn committed(&self) -> Version {
         match self {
-            Self::V2(report) => (
-                report.committed_major,
-                report.committed_minor,
-                report.committed_build,
-            ),
-            Self::V3(report) => (
-                report.committed_major,
-                report.committed_minor,
-                report.committed_build,
-            ),
+            Self::V2(report) => report.committed,
+            Self::V3(report) => report.committed,
         }
     }
 
@@ -418,6 +418,14 @@ impl AttestationReport {
         match self {
             Self::V2(report) => report.launch_tcb,
             Self::V3(report) => report.launch_tcb,
+        }
+    }
+
+    /// Get signature
+    pub fn signature(&self) -> Signature {
+        match self {
+            Self::V2(report) => report.signature,
+            Self::V3(report) => report.signature,
         }
     }
 }
@@ -457,20 +465,19 @@ pub struct AttestationReportV2 {
     pub plat_info: PlatformInfoV1,
     /// Information related to signing keys in the report. See KeyInfo
     pub key_info: KeyInfo,
-    _reserved_0: u32,
-    #[serde(with = "BigArray")]
+    #[serde(with = "serde_arrays")]
     /// Guest-provided 512 Bits of Data
     pub report_data: [u8; 64],
-    #[serde(with = "BigArray")]
+    #[serde(with = "serde_arrays")]
     /// The measurement calculated at launch.
     pub measurement: [u8; 48],
     /// Data provided by the hypervisor at launch.
     pub host_data: [u8; 32],
-    #[serde(with = "BigArray")]
+    #[serde(with = "serde_arrays")]
     /// SHA-384 digest of the ID public key that signed the ID block provided
     /// in SNP_LANUNCH_FINISH.
     pub id_key_digest: [u8; 48],
-    #[serde(with = "BigArray")]
+    #[serde(with = "serde_arrays")]
     /// SHA-384 digest of the Author public key that certified the ID key,
     /// if provided in SNP_LAUNCH_FINSIH. Zeroes if AUTHOR_KEY_EN is 1.
     pub author_key_digest: [u8; 48],
@@ -480,31 +487,18 @@ pub struct AttestationReportV2 {
     pub report_id_ma: [u8; 32],
     /// Reported TCB version used to derive the VCEK that signed this report.
     pub reported_tcb: TcbVersion,
-    _reserved_1: [u8; 24],
-    #[serde(with = "BigArray")]
+    #[serde(with = "serde_arrays")]
     /// If MaskChipId is set to 0, Identifier unique to the chip.
     /// Otherwise set to 0h.
     pub chip_id: [u8; 64],
     /// CommittedTCB
     pub committed_tcb: TcbVersion,
-    /// The build number of CurrentVersion
-    pub current_build: u8,
-    /// The minor number of CurrentVersion
-    pub current_minor: u8,
-    /// The major number of CurrentVersion
-    pub current_major: u8,
-    _reserved_2: u8,
-    /// The build number of CommittedVersion
-    pub committed_build: u8,
-    /// The minor number of CommittedVersion
-    pub committed_minor: u8,
-    /// The major number of CommittedVersion
-    pub committed_major: u8,
-    _reserved_3: u8,
+    /// The Current FW Version
+    pub current: Version,
+    /// The Committed FW Version
+    pub committed: Version,
     /// The CurrentTcb at the time the guest was launched or imported.
     pub launch_tcb: TcbVersion,
-    #[serde(with = "BigArray")]
-    _reserved_4: [u8; 168],
     /// Signature of bytes 0 to 0x29F inclusive of this report.
     /// The format of the signature is found within Signature.
     pub signature: Signature,
@@ -523,7 +517,6 @@ impl Default for AttestationReportV2 {
             current_tcb: Default::default(),
             plat_info: Default::default(),
             key_info: Default::default(),
-            _reserved_0: Default::default(),
             report_data: [0; 64],
             measurement: [0; 48],
             host_data: Default::default(),
@@ -532,21 +525,160 @@ impl Default for AttestationReportV2 {
             report_id: Default::default(),
             report_id_ma: Default::default(),
             reported_tcb: Default::default(),
-            _reserved_1: Default::default(),
             chip_id: [0; 64],
             committed_tcb: Default::default(),
-            current_build: Default::default(),
-            current_minor: Default::default(),
-            current_major: Default::default(),
-            _reserved_2: Default::default(),
-            committed_build: Default::default(),
-            committed_minor: Default::default(),
-            committed_major: Default::default(),
-            _reserved_3: Default::default(),
+            current: Default::default(),
+            committed: Default::default(),
             launch_tcb: Default::default(),
-            _reserved_4: [0; 168],
             signature: Default::default(),
         }
+    }
+}
+
+impl AttestationReport {
+    /// Attempt to build an attestation report form raw bytes.
+    pub fn from_bytes(mut bytes: &[u8]) -> Result<Self, std::io::Error> {
+        let stepper = &mut bytes;
+        let version: u32 = stepper.parse_bytes::<_, 0>()?;
+        match version {
+            2 => Ok(Self::V2(AttestationReportV2 {
+                version,
+                guest_svn: stepper.parse_bytes::<_, 0>()?,
+                policy: stepper.parse_bytes::<_, 0>()?,
+                family_id: stepper.parse_bytes::<_, 0>()?,
+                image_id: stepper.parse_bytes::<_, 0>()?,
+                vmpl: stepper.parse_bytes::<_, 0>()?,
+                sig_algo: stepper.parse_bytes::<_, 0>()?,
+                current_tcb: stepper.parse_bytes::<_, 0>()?,
+                plat_info: stepper.parse_bytes::<_, 0>()?,
+                key_info: stepper.parse_bytes::<_, 0>()?,
+                report_data: stepper.parse_bytes::<_, 4>()?,
+                measurement: stepper.parse_bytes::<_, 0>()?,
+                host_data: stepper.parse_bytes::<_, 0>()?,
+                id_key_digest: stepper.parse_bytes::<_, 0>()?,
+                author_key_digest: stepper.parse_bytes::<_, 0>()?,
+                report_id: stepper.parse_bytes::<_, 0>()?,
+                report_id_ma: stepper.parse_bytes::<_, 0>()?,
+                reported_tcb: stepper.parse_bytes::<_, 0>()?,
+                chip_id: stepper.parse_bytes::<_, 24>()?,
+                committed_tcb: stepper.parse_bytes::<_, 0>()?,
+                current: stepper.parse_bytes::<_, 0>()?,
+                committed: stepper.parse_bytes::<_, 1>()?,
+                launch_tcb: stepper.parse_bytes::<_, 1>()?,
+                signature: stepper.parse_bytes::<_, 168>()?,
+            })),
+            3 => Ok(Self::V3(AttestationReportV3 {
+                version,
+                guest_svn: stepper.parse_bytes::<_, 0>()?,
+                policy: stepper.parse_bytes::<_, 0>()?,
+                family_id: stepper.parse_bytes::<_, 0>()?,
+                image_id: stepper.parse_bytes::<_, 0>()?,
+                vmpl: stepper.parse_bytes::<_, 0>()?,
+                sig_algo: stepper.parse_bytes::<_, 0>()?,
+                current_tcb: stepper.parse_bytes::<_, 0>()?,
+                plat_info: stepper.parse_bytes::<_, 0>()?,
+                key_info: stepper.parse_bytes::<_, 0>()?,
+                report_data: stepper.parse_bytes::<_, 4>()?,
+                measurement: stepper.parse_bytes::<_, 0>()?,
+                host_data: stepper.parse_bytes::<_, 0>()?,
+                id_key_digest: stepper.parse_bytes::<_, 0>()?,
+                author_key_digest: stepper.parse_bytes::<_, 0>()?,
+                report_id: stepper.parse_bytes::<_, 0>()?,
+                report_id_ma: stepper.parse_bytes::<_, 0>()?,
+                reported_tcb: stepper.parse_bytes::<_, 0>()?,
+                cpuid_fam_id: stepper.parse_bytes::<_, 0>()?,
+                cpuid_mod_id: stepper.parse_bytes::<_, 0>()?,
+                cpuid_step: stepper.parse_bytes::<_, 0>()?,
+                chip_id: stepper.parse_bytes::<_, 21>()?,
+                committed_tcb: stepper.parse_bytes::<_, 0>()?,
+                current: stepper.parse_bytes::<_, 0>()?,
+                committed: stepper.parse_bytes::<_, 1>()?,
+                launch_tcb: stepper.parse_bytes::<_, 1>()?,
+                signature: stepper.parse_bytes::<_, 168>()?,
+            })),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid attestation report version",
+            )),
+        }
+    }
+
+    /// Build a byte slice from an AttestationReport structure.
+    pub fn write_bytes(self, mut handle: impl Write) -> Result<(), std::io::Error> {
+        handle.write_bytes::<_, 0>(self.version())?;
+        handle.write_bytes::<_, 0>(self.guest_svn())?;
+        handle.write_bytes::<_, 0>(self.policy())?;
+        handle.write_bytes::<_, 0>(self.family_id())?;
+        handle.write_bytes::<_, 0>(self.image_id())?;
+        handle.write_bytes::<_, 0>(self.vmpl())?;
+        handle.write_bytes::<_, 0>(self.sig_algo())?;
+        handle.write_bytes::<_, 0>(self.current_tcb())?;
+
+        match self {
+            Self::V2(report) => handle.write_bytes::<_, 0>(report.plat_info)?,
+            Self::V3(report) => handle.write_bytes::<_, 0>(report.plat_info)?,
+        }
+
+        handle.write_bytes::<_, 0>(self.key_info())?;
+        handle.write_bytes::<_, 4>(self.report_data())?;
+        handle.write_bytes::<_, 0>(self.measurement())?;
+        handle.write_bytes::<_, 0>(self.host_data())?;
+        handle.write_bytes::<_, 0>(self.id_key_digest())?;
+        handle.write_bytes::<_, 0>(self.author_key_digest())?;
+        handle.write_bytes::<_, 0>(self.report_id())?;
+        handle.write_bytes::<_, 0>(self.report_id_ma())?;
+        handle.write_bytes::<_, 0>(self.reported_tcb())?;
+
+        match self {
+            Self::V2(report) => handle.write_bytes::<_, 24>(report.chip_id)?,
+            Self::V3(report) => {
+                handle.write_bytes::<_, 0>(report.cpuid_fam_id)?;
+                handle.write_bytes::<_, 0>(report.cpuid_mod_id)?;
+                handle.write_bytes::<_, 0>(report.cpuid_step)?;
+                handle.write_bytes::<_, 21>(report.chip_id)?;
+            }
+        }
+
+        handle.write_bytes::<_, 0>(self.committed_tcb())?;
+        handle.write_bytes::<_, 0>(self.current())?;
+        handle.write_bytes::<_, 1>(self.committed())?;
+        handle.write_bytes::<_, 1>(self.launch_tcb())?;
+        handle.write_bytes::<_, 168>(self.signature())?;
+        Ok(())
+    }
+}
+
+impl Default for AttestationReport {
+    fn default() -> Self {
+        Self::V3(AttestationReportV3 {
+            version: Default::default(),
+            guest_svn: Default::default(),
+            policy: Default::default(),
+            family_id: Default::default(),
+            image_id: Default::default(),
+            vmpl: Default::default(),
+            sig_algo: Default::default(),
+            current_tcb: Default::default(),
+            plat_info: Default::default(),
+            key_info: Default::default(),
+            report_data: [0; 64],
+            measurement: [0; 48],
+            host_data: Default::default(),
+            id_key_digest: [0; 48],
+            author_key_digest: [0; 48],
+            report_id: Default::default(),
+            report_id_ma: Default::default(),
+            reported_tcb: Default::default(),
+            cpuid_fam_id: Default::default(),
+            cpuid_mod_id: Default::default(),
+            cpuid_step: Default::default(),
+            chip_id: [0; 64],
+            committed_tcb: Default::default(),
+            current: Default::default(),
+            committed: Default::default(),
+            launch_tcb: Default::default(),
+            signature: Default::default(),
+        })
     }
 }
 
@@ -555,7 +687,7 @@ impl Display for AttestationReportV2 {
         write!(
             f,
             r#"
-Attestation Report ({} bytes):
+Attestation Report:
 Version:                      {}
 Guest SVN:                    {}
 {}
@@ -578,17 +710,12 @@ Reported TCB:                 {}
 Chip ID:                      {}
 Committed TCB:
 {}
-Current Build:                {}
-Current Minor:                {}
-Current Major:                {}
-Committed Build:              {}
-Committed Minor:              {}
-Committed Major:              {}
+Current Version:              {}
+Committed Version:            {}
 Launch TCB:
 {}
 {}
 "#,
-            std::mem::size_of_val(self),
             self.version,
             self.guest_svn,
             self.policy,
@@ -609,31 +736,11 @@ Launch TCB:
             self.reported_tcb,
             hexdump(&self.chip_id),
             self.committed_tcb,
-            self.current_build,
-            self.current_minor,
-            self.current_major,
-            self.committed_build,
-            self.committed_minor,
-            self.committed_major,
+            self.current,
+            self.committed,
             self.launch_tcb,
             self.signature
         )
-    }
-}
-
-impl sealed::Sealed for AttestationReportV2 {}
-
-impl Attestable for AttestationReportV2 {
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-}
-
-impl TryFrom<&[u8]> for AttestationReportV2 {
-    type Error = AttestationReportError;
-
-    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
-        bincode::deserialize(bytes).map_err(|e| AttestationReportError::BincodeError(*e))
     }
 }
 
@@ -665,20 +772,19 @@ pub struct AttestationReportV3 {
     pub plat_info: PlatformInfoV2,
     /// Information related to signing keys in the report. See KeyInfo
     pub key_info: KeyInfo,
-    _reserved_0: u32,
-    #[serde(with = "BigArray")]
+    #[serde(with = "serde_arrays")]
     /// Guest-provided 512 Bits of Data
     pub report_data: [u8; 64],
-    #[serde(with = "BigArray")]
+    #[serde(with = "serde_arrays")]
     /// The measurement calculated at launch.
     pub measurement: [u8; 48],
     /// Data provided by the hypervisor at launch.
     pub host_data: [u8; 32],
-    #[serde(with = "BigArray")]
+    #[serde(with = "serde_arrays")]
     /// SHA-384 digest of the ID public key that signed the ID block provided
     /// in SNP_LANUNCH_FINISH.
     pub id_key_digest: [u8; 48],
-    #[serde(with = "BigArray")]
+    #[serde(with = "serde_arrays")]
     /// SHA-384 digest of the Author public key that certified the ID key,
     /// if provided in SNP_LAUNCH_FINSIH. Zeroes if AUTHOR_KEY_EN is 1.
     pub author_key_digest: [u8; 48],
@@ -694,31 +800,18 @@ pub struct AttestationReportV3 {
     pub cpuid_mod_id: u8,
     /// CPUID Stepping
     pub cpuid_step: u8,
-    _reserved_1: [u8; 21],
-    #[serde(with = "BigArray")]
+    #[serde(with = "serde_arrays")]
     /// If MaskChipId is set to 0, Identifier unique to the chip.
     /// Otherwise set to 0h.
     pub chip_id: [u8; 64],
     /// CommittedTCB
     pub committed_tcb: TcbVersion,
     /// The build number of CurrentVersion
-    pub current_build: u8,
-    /// The minor number of CurrentVersion
-    pub current_minor: u8,
-    /// The major number of CurrentVersion
-    pub current_major: u8,
-    _reserved_2: u8,
+    pub current: Version,
     /// The build number of CommittedVersion
-    pub committed_build: u8,
-    /// The minor number of CommittedVersion
-    pub committed_minor: u8,
-    /// The major number of CommittedVersion
-    pub committed_major: u8,
-    _reserved_3: u8,
+    pub committed: Version,
     /// The CurrentTcb at the time the guest was launched or imported.
     pub launch_tcb: TcbVersion,
-    #[serde(with = "BigArray")]
-    _reserved_4: [u8; 168],
     /// Signature of bytes 0 to 0x29F inclusive of this report.
     /// The format of the signature is found within Signature.
     pub signature: Signature,
@@ -737,7 +830,6 @@ impl Default for AttestationReportV3 {
             current_tcb: Default::default(),
             plat_info: Default::default(),
             key_info: Default::default(),
-            _reserved_0: Default::default(),
             report_data: [0; 64],
             measurement: [0; 48],
             host_data: Default::default(),
@@ -749,19 +841,11 @@ impl Default for AttestationReportV3 {
             cpuid_fam_id: Default::default(),
             cpuid_mod_id: Default::default(),
             cpuid_step: Default::default(),
-            _reserved_1: Default::default(),
             chip_id: [0; 64],
             committed_tcb: Default::default(),
-            current_build: Default::default(),
-            current_minor: Default::default(),
-            current_major: Default::default(),
-            _reserved_2: Default::default(),
-            committed_build: Default::default(),
-            committed_minor: Default::default(),
-            committed_major: Default::default(),
-            _reserved_3: Default::default(),
+            current: Default::default(),
+            committed: Default::default(),
             launch_tcb: Default::default(),
-            _reserved_4: [0; 168],
             signature: Default::default(),
         }
     }
@@ -772,7 +856,7 @@ impl Display for AttestationReportV3 {
         write!(
             f,
             r#"
-Attestation Report ({} bytes):
+Attestation Report:
 Version:                      {}
 Guest SVN:                    {}
 {}
@@ -798,17 +882,12 @@ CPUID Stepping:               {}
 Chip ID:                      {}
 Committed TCB:
 {}
-Current Build:                {}
-Current Minor:                {}
-Current Major:                {}
-Committed Build:              {}
-Committed Minor:              {}
-Committed Major:              {}
+Current Version:              {}
+Committed Version:            {}
 Launch TCB:
 {}
 {}
 "#,
-            std::mem::size_of_val(self),
             self.version,
             self.guest_svn,
             self.policy,
@@ -832,49 +911,49 @@ Launch TCB:
             self.cpuid_step,
             hexdump(&self.chip_id),
             self.committed_tcb,
-            self.current_build,
-            self.current_minor,
-            self.current_major,
-            self.committed_build,
-            self.committed_minor,
-            self.committed_major,
+            self.current,
+            self.committed,
             self.launch_tcb,
             self.signature
         )
     }
 }
 
-impl sealed::Sealed for AttestationReportV3 {}
+#[cfg(any(feature = "openssl", feature = "crypto_nossl"))]
+impl Verifiable for (&Chain, &AttestationReportV2) {
+    type Output = ();
 
-impl Attestable for AttestationReportV3 {
-    fn signature(&self) -> &Signature {
-        &self.signature
+    fn verify(self) -> io::Result<Self::Output> {
+        let report: AttestationReport = self.1.into();
+        (self.0, &report).verify()
     }
 }
+#[cfg(any(feature = "openssl", feature = "crypto_nossl"))]
+impl Verifiable for (&Chain, &AttestationReportV3) {
+    type Output = ();
 
-impl TryFrom<&[u8]> for AttestationReportV3 {
-    type Error = AttestationReportError;
-
-    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
-        bincode::deserialize(bytes).map_err(|e| AttestationReportError::BincodeError(*e))
+    fn verify(self) -> io::Result<Self::Output> {
+        let report: AttestationReport = self.1.into();
+        (self.0, &report).verify()
     }
 }
 
 #[cfg(feature = "openssl")]
-impl<T> Verifiable for (&Chain, &T)
-where
-    T: Attestable,
-{
+impl Verifiable for (&Chain, &AttestationReport) {
     type Output = ();
 
     fn verify(self) -> io::Result<Self::Output> {
         let vek = self.0.verify()?;
 
-        let sig = EcdsaSig::try_from(self.1.signature())?;
-        let measurable_bytes = self.1.measurable_bytes()?;
+        let sig = EcdsaSig::try_from(&self.1.signature())?;
+
+        let mut raw_report_bytes: Vec<u8> = Vec::with_capacity(1184usize);
+        self.1.write_bytes(&mut raw_report_bytes)?;
+
+        let measurable_bytes: &[u8] = &raw_report_bytes[..0x2a0];
 
         let mut hasher = Sha384::new();
-        hasher.update(&measurable_bytes);
+        hasher.update(measurable_bytes);
         let base_digest = hasher.finish();
 
         let ec = vek.public_key()?.ec_key()?;
@@ -890,20 +969,20 @@ where
 }
 
 #[cfg(feature = "openssl")]
-impl<T> Verifiable for (&Certificate, &T)
-where
-    T: Attestable,
-{
+impl Verifiable for (&Certificate, &AttestationReport) {
     type Output = ();
 
     fn verify(self) -> io::Result<Self::Output> {
         let vek = self.0;
 
-        let sig = EcdsaSig::try_from(self.1.signature())?;
-        let measurable_bytes = self.1.measurable_bytes()?;
+        let sig = EcdsaSig::try_from(&self.1.signature())?;
+        let mut raw_report_bytes: Vec<u8> = Vec::with_capacity(1184usize);
+        self.1.write_bytes(&mut raw_report_bytes).unwrap();
+
+        let measurable_bytes: &[u8] = &raw_report_bytes[..0x2a0];
 
         let mut hasher = Sha384::new();
-        hasher.update(&measurable_bytes);
+        hasher.update(measurable_bytes);
         let base_digest = hasher.finish();
 
         let ec = vek.public_key()?.ec_key()?;
@@ -919,10 +998,7 @@ where
 }
 
 #[cfg(feature = "crypto_nossl")]
-impl<T> Verifiable for (&Chain, &T)
-where
-    T: Attestable,
-{
+impl Verifiable for (&Chain, &AttestationReport) {
     type Output = ();
 
     fn verify(self) -> io::Result<Self::Output> {
@@ -932,9 +1008,12 @@ where
 
         let vek = self.0.verify()?;
 
-        let sig = p384::ecdsa::Signature::try_from(self.1.signature())?;
+        let sig = p384::ecdsa::Signature::try_from(&self.1.signature())?;
 
-        let measurable_bytes = self.1.measurable_bytes()?;
+        let mut raw_report_bytes: Vec<u8> = Vec::with_capacity(1184usize);
+        self.1.write_bytes(&mut raw_report_bytes).unwrap();
+
+        let measurable_bytes: &[u8] = &raw_report_bytes[..0x2a0];
 
         use sha2::Digest;
         let base_digest = sha2::Sha384::new_with_prefix(measurable_bytes);
@@ -956,10 +1035,7 @@ where
 }
 
 #[cfg(feature = "crypto_nossl")]
-impl<T> Verifiable for (&Certificate, &T)
-where
-    T: Attestable,
-{
+impl Verifiable for (&Certificate, &AttestationReport) {
     type Output = ();
 
     fn verify(self) -> io::Result<Self::Output> {
@@ -970,9 +1046,12 @@ where
 
         let vek = self.0;
 
-        let sig = p384::ecdsa::Signature::try_from(self.1.signature())?;
+        let sig = p384::ecdsa::Signature::try_from(&self.1.signature())?;
 
-        let measurable_bytes = self.1.measurable_bytes()?;
+        let mut raw_report_bytes: Vec<u8> = Vec::with_capacity(1184usize);
+        self.1.write_bytes(&mut raw_report_bytes).unwrap();
+
+        let measurable_bytes: &[u8] = &raw_report_bytes[..0x2a0];
 
         use sha2::Digest;
         let base_digest = sha2::Sha384::new_with_prefix(measurable_bytes);
@@ -1018,7 +1097,7 @@ bitfield! {
     /// | 63:25  | -                 | Reserved. MBZ.                                                                                                     >
     ///
     #[repr(C)]
-    #[derive(Default, Deserialize, Clone, Copy, Eq, PartialEq, Serialize, PartialOrd, Ord)]
+    #[derive(Deserialize, Clone, Copy, Eq, PartialEq, Serialize, PartialOrd, Ord)]
     pub struct GuestPolicy(u64);
     impl Debug;
     /// ABI_MINOR field: Indicates the minor API version.
@@ -1042,6 +1121,28 @@ bitfield! {
     pub rapl_dis, set_rapl_dis: 23, 23;
     /// CIPHERTEXT_HIDING field: (1) ciphertext hiding must be enabled, (0) ciphertext hiding may be enabled/disabled
     pub ciphertext_hiding, set_ciphertext_hiding: 24, 24;
+}
+
+impl Default for GuestPolicy {
+    fn default() -> Self {
+        Self(ByteParser::default())
+    }
+}
+
+impl ByteParser for GuestPolicy {
+    type Bytes = [u8; 8];
+
+    fn from_bytes(bytes: Self::Bytes) -> Self {
+        Self(u64::from_le_bytes(bytes))
+    }
+
+    fn to_bytes(&self) -> Self::Bytes {
+        self.0.to_le_bytes()
+    }
+
+    fn default() -> Self {
+        Self(Default::default())
+    }
 }
 
 impl Display for GuestPolicy {
@@ -1135,6 +1236,15 @@ impl PlatformInfo {
     }
 }
 
+impl From<u64> for GuestPolicy {
+    fn from(value: u64) -> Self {
+        // Bit 17 of the guest policy is reserved and must always be set to 1.
+        let reserved: u64 = 1 << 17;
+
+        GuestPolicy(value | reserved)
+    }
+}
+
 bitfield! {
     /// Version 1 PlatformInfo bitfield
     /// A structure with a bit-field unsigned 64 bit integer:
@@ -1145,7 +1255,7 @@ bitfield! {
     /// Bit 4 indicates if ciphertext hiding is enabled
     /// Bits 5-63 are reserved.
     #[repr(C)]
-    #[derive(Default, Deserialize, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+    #[derive(Deserialize, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
     pub struct PlatformInfoV1(u64);
     impl Debug;
     /// Returns the bit state of SMT
@@ -1160,6 +1270,40 @@ bitfield! {
     pub ciphertext_hiding_enabled, _: 4, 4;
     /// reserved
     reserved, _: 63, 5;
+}
+
+impl Default for PlatformInfoV1 {
+    fn default() -> Self {
+        Self(ByteParser::default())
+    }
+}
+
+impl From<u64> for PlatformInfoV1 {
+    fn from(value: u64) -> Self {
+        PlatformInfoV1(value)
+    }
+}
+
+impl From<PlatformInfoV1> for u64 {
+    fn from(value: PlatformInfoV1) -> Self {
+        value.0
+    }
+}
+
+impl ByteParser for PlatformInfoV1 {
+    type Bytes = [u8; 8];
+
+    fn from_bytes(bytes: Self::Bytes) -> Self {
+        Self(u64::from_le_bytes(bytes))
+    }
+
+    fn to_bytes(&self) -> Self::Bytes {
+        self.0.to_le_bytes()
+    }
+
+    fn default() -> Self {
+        Self(Default::default())
+    }
 }
 
 impl Display for PlatformInfoV1 {
@@ -1195,7 +1339,7 @@ bitfield! {
     /// Bit 5 indicates that alias detection has completed since the last system reset and there are no aliasing addresses. Resets to 0.
     /// Bits 5-63 are reserved.
     #[repr(C)]
-    #[derive(Default, Deserialize, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+    #[derive(Deserialize, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
     pub struct PlatformInfoV2(u64);
     impl Debug;
     /// Returns the bit state of SMT
@@ -1238,6 +1382,40 @@ Platform Info ({}):
     }
 }
 
+impl Default for PlatformInfoV2 {
+    fn default() -> Self {
+        Self(ByteParser::default())
+    }
+}
+
+impl From<u64> for PlatformInfoV2 {
+    fn from(value: u64) -> Self {
+        PlatformInfoV2(value)
+    }
+}
+
+impl From<PlatformInfoV2> for u64 {
+    fn from(value: PlatformInfoV2) -> Self {
+        value.0
+    }
+}
+
+impl ByteParser for PlatformInfoV2 {
+    type Bytes = [u8; 8];
+
+    fn from_bytes(bytes: Self::Bytes) -> Self {
+        Self(u64::from_le_bytes(bytes))
+    }
+
+    fn to_bytes(&self) -> Self::Bytes {
+        self.0.to_le_bytes()
+    }
+
+    fn default() -> Self {
+        Self(Default::default())
+    }
+}
+
 bitfield! {
     /// When an attestation report is requested, the user can request to have the report to not be signed, or sign with different keys. The user may also
     /// pass in the author key when launching the guest. This field provides that information and will be present in the attestation report.
@@ -1249,7 +1427,7 @@ bitfield! {
     /// | 4:2    | SIGNING_KEY       | Encodes the key used to sign this report.                                                                          >
     /// | 5:31   | -                 | Reserved. Must be zero.                                                                                            >
     #[repr(C)]
-    #[derive(Default, Deserialize, Clone, Copy, Eq, PartialEq, PartialOrd, Ord, Serialize)]
+    #[derive(Deserialize, Clone, Copy, Eq, PartialEq, PartialOrd, Ord, Serialize)]
     pub struct KeyInfo(u32);
     impl Debug;
     /// AUTHOR_KEY_EN field: Indicates that the digest of the author key is present in AUTHOR_KEY_DIGEST
@@ -1266,6 +1444,40 @@ bitfield! {
     pub signing_key, _: 4,2;
     /// reserved
     reserved, _: 31, 5;
+}
+
+impl Default for KeyInfo {
+    fn default() -> Self {
+        Self(ByteParser::default())
+    }
+}
+
+impl ByteParser for KeyInfo {
+    type Bytes = [u8; 4];
+
+    fn from_bytes(bytes: Self::Bytes) -> Self {
+        Self(u32::from_le_bytes(bytes))
+    }
+
+    fn to_bytes(&self) -> Self::Bytes {
+        self.0.to_le_bytes()
+    }
+
+    fn default() -> Self {
+        Self(Default::default())
+    }
+}
+
+impl From<u32> for KeyInfo {
+    fn from(value: u32) -> Self {
+        KeyInfo(value)
+    }
+}
+
+impl From<KeyInfo> for u32 {
+    fn from(value: KeyInfo) -> Self {
+        value.0
+    }
 }
 
 impl Display for KeyInfo {
@@ -1296,6 +1508,7 @@ Key Information:
 mod tests {
 
     use super::*;
+    use std::io::{ErrorKind, Write};
 
     #[test]
     fn test_derive_key_new() {
@@ -1366,10 +1579,9 @@ mod tests {
             image_id: [0; 16],
             vmpl: 0,
             sig_algo: 0,
-            current_tcb: TcbVersion::default(),
-            plat_info: PlatformInfoV1::default(),
-            key_info: KeyInfo::default(),
-            _reserved_0: 0,
+            current_tcb: Default::default(),
+            plat_info: Default::default(),
+            key_info: Default::default(),
             report_data: [0; 64],
             measurement: [0; 48],
             host_data: [0; 32],
@@ -1377,21 +1589,13 @@ mod tests {
             author_key_digest: [0; 48],
             report_id: [0; 32],
             report_id_ma: [0; 32],
-            reported_tcb: TcbVersion::default(),
-            _reserved_1: [0; 24],
+            reported_tcb: Default::default(),
             chip_id: [0; 64],
-            committed_tcb: TcbVersion::default(),
-            current_build: 0,
-            current_minor: 0,
-            current_major: 0,
-            _reserved_2: 0,
-            committed_build: 0,
-            committed_minor: 0,
-            committed_major: 0,
-            _reserved_3: 0,
-            launch_tcb: TcbVersion::default(),
-            _reserved_4: [0; 168],
-            signature: Signature::default(),
+            committed_tcb: Default::default(),
+            current: Default::default(),
+            committed: Default::default(),
+            launch_tcb: Default::default(),
+            signature: Default::default(),
         };
 
         assert_eq!(AttestationReportV2::default(), expected);
@@ -1407,10 +1611,9 @@ mod tests {
             image_id: [0; 16],
             vmpl: 0,
             sig_algo: 0,
-            current_tcb: TcbVersion::default(),
-            plat_info: PlatformInfoV2::default(),
-            key_info: KeyInfo::default(),
-            _reserved_0: 0,
+            current_tcb: Default::default(),
+            plat_info: Default::default(),
+            key_info: Default::default(),
             report_data: [0; 64],
             measurement: [0; 48],
             host_data: [0; 32],
@@ -1418,24 +1621,16 @@ mod tests {
             author_key_digest: [0; 48],
             report_id: [0; 32],
             report_id_ma: [0; 32],
-            reported_tcb: TcbVersion::default(),
+            reported_tcb: Default::default(),
             cpuid_fam_id: 0,
             cpuid_mod_id: 0,
             cpuid_step: 0,
-            _reserved_1: [0; 21],
             chip_id: [0; 64],
-            committed_tcb: TcbVersion::default(),
-            current_build: 0,
-            current_minor: 0,
-            current_major: 0,
-            _reserved_2: 0,
-            committed_build: 0,
-            committed_minor: 0,
-            committed_major: 0,
-            _reserved_3: 0,
-            launch_tcb: TcbVersion::default(),
-            _reserved_4: [0; 168],
-            signature: Signature::default(),
+            committed_tcb: Default::default(),
+            current: Default::default(),
+            committed: Default::default(),
+            launch_tcb: Default::default(),
+            signature: Default::default(),
         };
 
         assert_eq!(AttestationReportV3::default(), expected);
@@ -1446,15 +1641,14 @@ mod tests {
         let expected: AttestationReportV2 = AttestationReportV2 {
             version: Default::default(),
             guest_svn: Default::default(),
-            policy: GuestPolicy::default(),
+            policy: Default::default(),
             family_id: Default::default(),
             image_id: Default::default(),
             vmpl: Default::default(),
             sig_algo: Default::default(),
-            current_tcb: TcbVersion::default(),
-            plat_info: PlatformInfoV1::default(),
-            key_info: KeyInfo::default(),
-            _reserved_0: Default::default(),
+            current_tcb: Default::default(),
+            plat_info: Default::default(),
+            key_info: Default::default(),
             report_data: [0; 64],
             measurement: [0; 48],
             host_data: Default::default(),
@@ -1462,21 +1656,13 @@ mod tests {
             author_key_digest: [0; 48],
             report_id: Default::default(),
             report_id_ma: Default::default(),
-            reported_tcb: TcbVersion::default(),
-            _reserved_1: Default::default(),
+            reported_tcb: Default::default(),
             chip_id: [0; 64],
-            committed_tcb: TcbVersion::default(),
-            current_build: Default::default(),
-            current_minor: Default::default(),
-            current_major: Default::default(),
-            _reserved_2: Default::default(),
-            committed_build: Default::default(),
-            committed_minor: Default::default(),
-            committed_major: Default::default(),
-            _reserved_3: Default::default(),
-            launch_tcb: TcbVersion::default(),
-            _reserved_4: [0; 168],
-            signature: Signature::default(),
+            committed_tcb: Default::default(),
+            current: Default::default(),
+            committed: Default::default(),
+            launch_tcb: Default::default(),
+            signature: Default::default(),
         };
 
         assert_eq!(AttestationReportV2::default(), expected);
@@ -1487,15 +1673,14 @@ mod tests {
         let expected: AttestationReportV3 = AttestationReportV3 {
             version: Default::default(),
             guest_svn: Default::default(),
-            policy: GuestPolicy::default(),
+            policy: Default::default(),
             family_id: Default::default(),
             image_id: Default::default(),
             vmpl: Default::default(),
             sig_algo: Default::default(),
-            current_tcb: TcbVersion::default(),
-            plat_info: PlatformInfoV2::default(),
-            key_info: KeyInfo::default(),
-            _reserved_0: Default::default(),
+            current_tcb: Default::default(),
+            plat_info: Default::default(),
+            key_info: Default::default(),
             report_data: [0; 64],
             measurement: [0; 48],
             host_data: Default::default(),
@@ -1503,24 +1688,16 @@ mod tests {
             author_key_digest: [0; 48],
             report_id: Default::default(),
             report_id_ma: Default::default(),
-            reported_tcb: TcbVersion::default(),
+            reported_tcb: Default::default(),
             cpuid_fam_id: Default::default(),
             cpuid_mod_id: Default::default(),
             cpuid_step: Default::default(),
-            _reserved_1: Default::default(),
             chip_id: [0; 64],
-            committed_tcb: TcbVersion::default(),
-            current_build: Default::default(),
-            current_minor: Default::default(),
-            current_major: Default::default(),
-            _reserved_2: Default::default(),
-            committed_build: Default::default(),
-            committed_minor: Default::default(),
-            committed_major: Default::default(),
-            _reserved_3: Default::default(),
-            launch_tcb: TcbVersion::default(),
-            _reserved_4: [0; 168],
-            signature: Signature::default(),
+            committed_tcb: Default::default(),
+            current: Default::default(),
+            committed: Default::default(),
+            launch_tcb: Default::default(),
+            signature: Default::default(),
         };
 
         assert_eq!(AttestationReportV3::default(), expected);
@@ -1529,7 +1706,7 @@ mod tests {
     #[test]
     fn test_attestation_report_v2_fmt() {
         let expected: &str = r#"
-Attestation Report (1184 bytes):
+Attestation Report:
 Version:                      0
 Guest SVN:                    0
 
@@ -1624,12 +1801,8 @@ TCB Version:
   TEE:         0
   Boot Loader: 0
   
-Current Build:                0
-Current Minor:                0
-Current Major:                0
-Committed Build:              0
-Committed Minor:              0
-Committed Major:              0
+Current Version:              0.0.0
+Committed Version:            0.0.0
 Launch TCB:
 
 TCB Version:
@@ -1663,7 +1836,7 @@ Signature:
     #[test]
     fn test_attestation_report_v3_fmt() {
         let expected: &str = r#"
-Attestation Report (1184 bytes):
+Attestation Report:
 Version:                      0
 Guest SVN:                    0
 
@@ -1762,12 +1935,8 @@ TCB Version:
   TEE:         0
   Boot Loader: 0
   
-Current Build:                0
-Current Minor:                0
-Current Major:                0
-Committed Build:              0
-Committed Minor:              0
-Committed Major:              0
+Current Version:              0.0.0
+Committed Version:            0.0.0
 Launch TCB:
 
 TCB Version:
@@ -1849,7 +2018,7 @@ Signature:
 
     #[test]
     fn test_set_guest_policy_max() {
-        let mut gp: GuestPolicy = GuestPolicy::default();
+        let mut gp: GuestPolicy = Default::default();
 
         assert_eq!(gp.abi_minor(), 0);
         gp.set_abi_minor(1);
@@ -2084,7 +2253,7 @@ Key Information:
 
     #[test]
     fn test_guest_policy_serialization() {
-        let mut original = GuestPolicy::default();
+        let mut original: GuestPolicy = Default::default();
         original.set_abi_major(2);
         original.set_abi_minor(1);
         original.set_smt_allowed(1);
@@ -2128,113 +2297,6 @@ Key Information:
         let binary = bincode::serialize(&original).unwrap();
         let from_binary: AttestationReportV3 = bincode::deserialize(&binary).unwrap();
         assert_eq!(original, from_binary);
-    }
-
-    #[test]
-    fn test_attestation_report_enum_v2_serialization() {
-        let report_v2 = AttestationReportV2 {
-            version: 2,
-            guest_svn: 1,
-            policy: GuestPolicy::default(),
-            family_id: Default::default(),
-            image_id: Default::default(),
-            vmpl: Default::default(),
-            sig_algo: Default::default(),
-            current_tcb: TcbVersion::default(),
-            plat_info: PlatformInfoV1::default(),
-            key_info: KeyInfo::default(),
-            _reserved_0: Default::default(),
-            report_data: [0; 64],
-            measurement: [0; 48],
-            host_data: Default::default(),
-            id_key_digest: [0; 48],
-            author_key_digest: [0; 48],
-            report_id: Default::default(),
-            report_id_ma: Default::default(),
-            reported_tcb: TcbVersion::default(),
-            _reserved_1: Default::default(),
-            chip_id: [0; 64],
-            committed_tcb: TcbVersion::default(),
-            current_build: Default::default(),
-            current_minor: Default::default(),
-            current_major: Default::default(),
-            _reserved_2: Default::default(),
-            committed_build: Default::default(),
-            committed_minor: Default::default(),
-            committed_major: Default::default(),
-            _reserved_3: Default::default(),
-            launch_tcb: TcbVersion::default(),
-            _reserved_4: [0; 168],
-            signature: Signature::default(),
-        };
-
-        let attestation_report = AttestationReport::V2(report_v2);
-
-        let serialized = attestation_report.to_bytes().expect("Serialization failed");
-
-        assert_eq!(serialized, attestation_report.to_bytes().unwrap());
-
-        let deserialized =
-            AttestationReport::from_bytes(&serialized).expect("Deserialization failed");
-
-        assert_eq!(attestation_report.version(), deserialized.version());
-        assert_eq!(attestation_report.guest_svn(), deserialized.guest_svn());
-        assert_eq!(attestation_report.policy(), deserialized.policy());
-    }
-
-    #[test]
-    fn test_attestation_report_enum_v3_serialization() {
-        let report_v3 = AttestationReportV3 {
-            version: 2,
-            guest_svn: 1,
-            policy: GuestPolicy::default(),
-            family_id: Default::default(),
-            image_id: Default::default(),
-            vmpl: Default::default(),
-            sig_algo: Default::default(),
-            current_tcb: TcbVersion::default(),
-            plat_info: PlatformInfoV2::default(),
-            key_info: KeyInfo::default(),
-            _reserved_0: Default::default(),
-            report_data: [0; 64],
-            measurement: [0; 48],
-            host_data: Default::default(),
-            id_key_digest: [0; 48],
-            author_key_digest: [0; 48],
-            report_id: Default::default(),
-            report_id_ma: Default::default(),
-            reported_tcb: TcbVersion::default(),
-            cpuid_fam_id: Default::default(),
-            cpuid_mod_id: Default::default(),
-            cpuid_step: Default::default(),
-            _reserved_1: Default::default(),
-            chip_id: [0; 64],
-            committed_tcb: TcbVersion::default(),
-            current_build: Default::default(),
-            current_minor: Default::default(),
-            current_major: Default::default(),
-            _reserved_2: Default::default(),
-            committed_build: Default::default(),
-            committed_minor: Default::default(),
-            committed_major: Default::default(),
-            _reserved_3: Default::default(),
-            launch_tcb: TcbVersion::default(),
-            _reserved_4: [0; 168],
-            signature: Signature::default(),
-        };
-
-        let attestation_report = AttestationReport::V3(report_v3);
-
-        let serialized = attestation_report.to_bytes().expect("Serialization failed");
-
-        assert_eq!(serialized, attestation_report.to_bytes().unwrap());
-
-        let deserialized =
-            AttestationReport::from_bytes(&serialized).expect("Deserialization failed");
-
-        assert_eq!(attestation_report.version(), deserialized.version());
-        assert_eq!(attestation_report.guest_svn(), deserialized.guest_svn());
-        assert_eq!(attestation_report.policy(), deserialized.policy());
     }
 
     #[test]
@@ -2342,7 +2404,7 @@ Key Information:
 
     #[test]
     fn test_guest_policy_combined_fields() {
-        let mut policy = GuestPolicy::default();
+        let mut policy: GuestPolicy = Default::default();
 
         policy.set_abi_major(2);
         policy.set_abi_minor(1);
@@ -2356,5 +2418,296 @@ Key Information:
 
         let policy_u64: u64 = policy.into();
         assert_eq!(policy_u64 & (1 << 17), 1 << 17); // Reserved bit 17 must be 1
+    }
+
+    #[test]
+    fn test_version_display() {
+        let version = Version::new(3, 2, 1);
+        assert_eq!(version.to_string(), "3.2.1");
+
+        let max_version = Version::new(255, 255, 255);
+        assert_eq!(max_version.to_string(), "255.255.255");
+
+        let min_version = Version::new(0, 0, 0);
+        assert_eq!(min_version.to_string(), "0.0.0");
+    }
+
+    #[test]
+    fn test_version_byte_parser() {
+        // Test from_bytes
+        let bytes = [1, 2, 3];
+        let version = Version::from_bytes(bytes);
+        assert_eq!(version, Version::new(3, 2, 1));
+
+        // Test to_bytes
+        let version = Version::new(4, 5, 6);
+        let bytes = version.to_bytes();
+        assert_eq!(bytes, [6, 5, 4]);
+
+        // Test roundtrip
+        let original = Version::new(7, 8, 9);
+        let bytes = original.to_bytes();
+        let roundtrip = Version::from_bytes(bytes);
+        assert_eq!(original, roundtrip);
+
+        // Test default
+        assert_eq!(<Version as Default>::default(), Version::new(0, 0, 0));
+    }
+
+    #[test]
+    fn test_attestation_report_from_bytes() {
+        // Create a valid attestation report bytes minus one byte.
+        let mut bytes: Vec<u8> = vec![0; 1183];
+
+        // Push the version byte at the beginning.
+        bytes.insert(0, 2);
+
+        // Test valid input
+        let result = AttestationReport::from_bytes(&bytes);
+        assert!(result.is_ok());
+
+        // Test invalid input (too short)
+        let result = AttestationReport::from_bytes(&bytes[..100]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_attestation_report_write_bytes() {
+        let report = AttestationReport::default();
+        let mut buffer = Vec::new();
+
+        // Test successful write
+        let result = report.write_bytes(&mut buffer);
+        assert!(result.is_ok());
+
+        // Test writing to a failing writer
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(ErrorKind::Other, "test error"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = FailingWriter;
+
+        let result = report.write_bytes(FailingWriter);
+        assert!(result.is_err());
+        assert!(writer.flush().is_ok());
+    }
+
+    #[test]
+    fn test_version_edge_cases() {
+        // Test max values
+        let version = Version::new(255, 255, 255);
+        let bytes = version.to_bytes();
+        assert_eq!(bytes, [255, 255, 255]);
+
+        // Test mixed values
+        let version = Version::new(0, 255, 0);
+        let bytes = version.to_bytes();
+        assert_eq!(bytes, [0, 255, 0]);
+    }
+
+    #[test]
+    fn test_attestation_report_from_bytes_errors() {
+        let empty_bytes = [0; 1184];
+        // Test with empty input
+        let result = AttestationReport::from_bytes(&empty_bytes);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidData);
+
+        // Test with partial input
+        let partial_bytes = vec![0u8; 100];
+        let result = AttestationReport::from_bytes(&partial_bytes);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_attestation_report_write_bytes_validation() {
+        let report: AttestationReport = AttestationReport::V2(AttestationReportV2 {
+            version: 2,
+            ..Default::default()
+        });
+        let mut buffer = Vec::new();
+
+        // Write report to buffer
+        report.write_bytes(&mut buffer).unwrap();
+
+        // Verify the written data can be read back
+        let read_back = AttestationReport::from_bytes(&buffer);
+        assert!(read_back.is_ok());
+        assert_eq!(read_back.unwrap(), report);
+    }
+
+    #[test]
+    fn test_version_ordering() {
+        let v1 = Version::new(1, 0, 0);
+        let v2 = Version::new(1, 0, 1);
+        let v3 = Version::new(1, 1, 0);
+
+        assert!(v1 < v2);
+        assert!(v2 < v3);
+        assert!(v1 < v3);
+
+        // Test equality
+        assert_eq!(Version::new(1, 2, 3), Version::new(1, 2, 3));
+        assert_ne!(Version::new(1, 2, 3), Version::new(1, 2, 4));
+    }
+
+    #[test]
+    fn test_version_copy() {
+        let original = Version::new(1, 2, 3);
+        let cloned = original;
+
+        assert_eq!(original, cloned);
+        assert_eq!(original.to_bytes(), cloned.to_bytes());
+    }
+
+    #[test]
+    fn test_attestation_report_complex_write() {
+        let report = AttestationReportV2 {
+            version: 2,
+            guest_svn: 1,
+            policy: GuestPolicy::from(0xFF),
+            family_id: [0xAA; 16],
+            image_id: [0xBB; 16],
+            ..Default::default()
+        };
+        let report = AttestationReport::V2(report);
+
+        let mut buffer = Vec::new();
+        assert!(report.write_bytes(&mut buffer).is_ok());
+
+        // Read back and verify
+        let read_back = AttestationReport::from_bytes(&buffer).unwrap();
+        assert_eq!(read_back.version(), 2);
+        assert_eq!(read_back.guest_svn(), 1);
+        assert_eq!(read_back.family_id(), [0xAA; 16]);
+        assert_eq!(read_back.image_id(), [0xBB; 16]);
+    }
+
+    #[test]
+    fn test_write_with_limited_writer() {
+        let report = AttestationReport::default();
+
+        // Writer that can only write small chunks
+        struct LimitedWriter {
+            data: Vec<u8>,
+            max_write: usize,
+        }
+
+        impl Write for LimitedWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let write_size = std::cmp::min(self.max_write, buf.len());
+                self.data.extend_from_slice(&buf[..write_size]);
+                Ok(write_size)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = LimitedWriter {
+            data: Vec::new(),
+            max_write: 16, // Only write 16 bytes at a time
+        };
+
+        assert!(report.write_bytes(&mut writer).is_ok());
+        assert!(writer.flush().is_ok());
+    }
+
+    #[test]
+    fn test_platform_v1_info_from_u64() {
+        let value: u64 = 0xFFFF;
+        let platform_info = PlatformInfoV1::from(value);
+        assert_eq!(platform_info.0, value);
+
+        let value: u64 = 0;
+        let platform_info = PlatformInfoV1::from(value);
+        assert_eq!(platform_info.0, value);
+
+        let value: u64 = u64::MAX;
+        let platform_info = PlatformInfoV1::from(value);
+        assert_eq!(platform_info.0, value);
+    }
+
+    #[test]
+    fn test_platform_v2_info_from_u64() {
+        let value: u64 = 0xFFFF;
+        let platform_info = PlatformInfoV2::from(value);
+        assert_eq!(platform_info.0, value);
+
+        let value: u64 = 0;
+        let platform_info = PlatformInfoV2::from(value);
+        assert_eq!(platform_info.0, value);
+
+        let value: u64 = u64::MAX;
+        let platform_info = PlatformInfoV2::from(value);
+        assert_eq!(platform_info.0, value);
+    }
+
+    #[test]
+    fn test_platform_v1_info_into_u64() {
+        let platform_info = PlatformInfoV1(0xFFFF);
+        let value: u64 = platform_info.into();
+        assert_eq!(value, 0xFFFF);
+
+        let platform_info = PlatformInfoV1(0);
+        let value: u64 = platform_info.into();
+        assert_eq!(value, 0);
+
+        let platform_info = PlatformInfoV1(u64::MAX);
+        let value: u64 = platform_info.into();
+        assert_eq!(value, u64::MAX);
+    }
+
+    #[test]
+    fn test_platform_v2_info_into_u64() {
+        let platform_info = PlatformInfoV2(0xFFFF);
+        let value: u64 = platform_info.into();
+        assert_eq!(value, 0xFFFF);
+
+        let platform_info = PlatformInfoV2(0);
+        let value: u64 = platform_info.into();
+        assert_eq!(value, 0);
+
+        let platform_info = PlatformInfoV2(u64::MAX);
+        let value: u64 = platform_info.into();
+        assert_eq!(value, u64::MAX);
+    }
+
+    #[test]
+    fn test_key_info_from_u32() {
+        let value: u32 = 0xFFFF;
+        let key_info = KeyInfo::from(value);
+        assert_eq!(key_info.0, value);
+
+        let value: u32 = 0;
+        let key_info = KeyInfo::from(value);
+        assert_eq!(key_info.0, value);
+
+        let value: u32 = u32::MAX;
+        let key_info = KeyInfo::from(value);
+        assert_eq!(key_info.0, value);
+    }
+
+    #[test]
+    fn test_key_info_into_u32() {
+        let key_info = KeyInfo(0xFFFF);
+        let value: u32 = key_info.into();
+        assert_eq!(value, 0xFFFF);
+
+        let key_info = KeyInfo(0);
+        let value: u32 = key_info.into();
+        assert_eq!(value, 0);
+
+        let key_info = KeyInfo(u32::MAX);
+        let value: u32 = key_info.into();
+        assert_eq!(value, u32::MAX);
     }
 }

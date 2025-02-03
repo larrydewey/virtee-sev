@@ -4,13 +4,15 @@
 
 use crate::error::LargeArrayError;
 use serde::{Deserialize, Serialize};
-use serde_big_array::BigArray;
-use std::convert::{TryFrom, TryInto};
+use std::{
+    convert::{TryFrom, TryInto},
+    ops::{Deref, DerefMut},
+};
 
 /// Large array structure to serialize and default arrays larger than 32 bytes.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 #[repr(C)]
-pub struct LargeArray<T, const N: usize>(#[serde(with = "BigArray")] [T; N])
+pub struct LargeArray<T, const N: usize>(#[serde(with = "serde_arrays")] [T; N])
 where
     T: for<'a> Deserialize<'a> + Serialize;
 
@@ -66,14 +68,42 @@ where
     pub fn as_array(&self) -> [T; N] {
         self.0
     }
+}
 
-    /// Get the large array as a slice
-    pub fn as_slice(&self) -> &[T; N] {
+impl<T, const N: usize> AsRef<[T]> for LargeArray<T, N>
+where
+    T: std::marker::Copy + std::default::Default + Serialize + for<'a> Deserialize<'a>,
+{
+    fn as_ref(&self) -> &[T] {
+        self.0.as_slice()
+    }
+}
+
+impl<T, const N: usize> AsMut<[T]> for LargeArray<T, N>
+where
+    T: std::marker::Copy + std::default::Default + Serialize + for<'a> Deserialize<'a>,
+{
+    fn as_mut(&mut self) -> &mut [T] {
+        self.0.as_mut_slice()
+    }
+}
+
+impl<T, const N: usize> Deref for LargeArray<T, N>
+where
+    T: std::marker::Copy + std::default::Default + Serialize + for<'a> Deserialize<'a>,
+{
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
         &self.0
     }
+}
 
-    /// Get the large array as a mutable slice
-    pub fn as_mut_slice(&mut self) -> &mut [T; N] {
+impl<T, const N: usize> DerefMut for LargeArray<T, N>
+where
+    T: std::marker::Copy + std::default::Default + Serialize + for<'a> Deserialize<'a>,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }

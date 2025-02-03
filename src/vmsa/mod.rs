@@ -4,12 +4,14 @@
 
 #![allow(dead_code)]
 
-use super::*;
+use super::{
+    util::{TypeLoad, TypeSave},
+    *,
+};
 
 use std::{fs, io, mem::size_of};
 
 use codicon::{Decoder, Encoder};
-use serde_big_array::BigArray;
 
 const ATTR_G_SHIFT: usize = 23;
 const ATTR_B_SHIFT: usize = 22;
@@ -99,7 +101,7 @@ pub struct Vmsa {
     tr: VmcbSegment,
 
     /// Reserved.
-    #[serde(with = "BigArray")]
+    #[serde(with = "serde_arrays")]
     reserved_1: [u8; 43],
 
     /// Current privilege level.
@@ -112,7 +114,7 @@ pub struct Vmsa {
     efer: u64,
 
     /// Reserved.
-    #[serde(with = "BigArray")]
+    #[serde(with = "serde_arrays")]
     reserved_3: [u8; 104],
 
     /// Bitmap of supervisor-level state components. System software sets bits
@@ -143,7 +145,7 @@ pub struct Vmsa {
     rip: u64,
 
     /// Reserved.
-    #[serde(with = "BigArray")]
+    #[serde(with = "serde_arrays")]
     reserved_4: [u8; 88],
 
     /// Stack pointer.
@@ -210,7 +212,7 @@ pub struct Vmsa {
     last_excp_to: u64,
 
     /// Reserved.
-    #[serde(with = "BigArray")]
+    #[serde(with = "serde_arrays")]
     reserved_7: [u8; 72],
 
     /// Speculation Control of MSRs. Documented in Section 3.2.9 of the
@@ -292,7 +294,7 @@ pub struct Vmsa {
     sw_scratch: u64,
 
     /// Reserved.
-    #[serde(with = "BigArray")]
+    #[serde(with = "serde_arrays")]
     reserved_11: [u8; 56],
 
     /// XCR0 register.
