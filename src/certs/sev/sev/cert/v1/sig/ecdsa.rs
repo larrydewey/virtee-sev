@@ -6,7 +6,6 @@ use {super::*, openssl::ecdsa};
 use crate::util::hexdump;
 
 use serde::{Deserialize, Serialize};
-use serde_big_array::BigArray;
 
 const SIG_PIECE_SIZE: usize = std::mem::size_of::<[u8; 72]>();
 
@@ -14,11 +13,11 @@ const SIG_PIECE_SIZE: usize = std::mem::size_of::<[u8; 72]>();
 #[repr(C)]
 #[derive(Copy, Clone, Deserialize, Serialize)]
 pub struct Signature {
-    #[serde(with = "BigArray")]
+    #[serde(with = "serde_arrays")]
     r: [u8; 72],
-    #[serde(with = "BigArray")]
+    #[serde(with = "serde_arrays")]
     s: [u8; 72],
-    #[serde(with = "BigArray")]
+    #[serde(with = "serde_arrays")]
     _reserved: [u8; 512 - (SIG_PIECE_SIZE * 2)],
 }
 

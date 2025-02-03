@@ -87,8 +87,7 @@ mod snp {
         let chain = Chain { ca, vek: vcek };
 
         let report_bytes = hex::decode(TEST_MILAN_ATTESTATION_REPORT).unwrap();
-
-        let report = AttestationReport::try_from(report_bytes.as_slice()).unwrap();
+        let report: AttestationReport = AttestationReport::from_bytes(&report_bytes).unwrap();
 
         assert_eq!((&chain, &report).verify().ok(), Some(()));
     }
